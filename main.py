@@ -9,6 +9,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemo
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from aiogram.client.session.aiohttp import AiohttpSession
 
 # ИМПОРТЫ
 from database import init_db, add_habit, get_all_user_habits, update_habit_stats, set_user_sheet, get_user_sheet, get_habit_name, delete_habit, update_habit_time, get_habits_by_time
@@ -19,7 +20,14 @@ logging.basicConfig(level=logging.ERROR)
 env_file = find_dotenv()
 if not env_file: exit("❌ .env не найден")
 load_dotenv(env_file)
-bot = Bot(token=os.getenv("BOT_TOKEN"))
+# Проверяем, запущены ли мы на PythonAnywhere
+if os.getenv("PYTHONANYWHERE_DOMAIN"):
+    # Если да — используем их специальный прокси
+    session = AiohttpSession(proxy="http://proxy.server:3128")
+    bot = Bot(token=token, session=session)
+else:
+    # Если нет (мы на Маке) — работаем как обычно
+    bot = Bot(token=token)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
