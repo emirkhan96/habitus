@@ -17,17 +17,26 @@ from google_manager import write_to_sheet, get_bot_email, check_sheet_access
 
 logging.basicConfig(level=logging.ERROR)
 
+# --- НАСТРОЙКА ОКРУЖЕНИЯ ---
 env_file = find_dotenv()
-if not env_file: exit("❌ .env не найден")
+if not env_file:
+    exit("❌ .env не найден")
 load_dotenv(env_file)
-# Проверяем, запущены ли мы на PythonAnywhere
+
+# 1. Сначала загружаем токен
+token = os.getenv("BOT_TOKEN")
+if not token:
+    exit("❌ Ошибка: Переменная BOT_TOKEN не найдена в .env")
+
+# 2. Настройка бота под PythonAnywhere или Локальный запуск
 if os.getenv("PYTHONANYWHERE_DOMAIN"):
-    # Если да — используем их специальный прокси
+    print("🌍 Запуск на PythonAnywhere (используем прокси)...")
     session = AiohttpSession(proxy="http://proxy.server:3128")
     bot = Bot(token=token, session=session)
 else:
-    # Если нет (мы на Маке) — работаем как обычно
+    print("💻 Локальный запуск...")
     bot = Bot(token=token)
+
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
@@ -36,10 +45,10 @@ class HabitForm(StatesGroup):
     name = State(); frequency = State(); time = State()
 class EditForm(StatesGroup):
     waiting_for_new_time = State()
-class IntegrationSetup(StatesGroup): # Состояние для мастера настройки
+class IntegrationSetup(StatesGroup): 
     waiting_for_link = State()
 
-# --- НОВОЕ ГЛАВНОЕ МЕНЮ ---
+# --- МЕНЮ ---
 kb_menu = [
     [KeyboardButton(text="Новая привычка ➕"), KeyboardButton(text="Мои привычки 📋")], 
     [KeyboardButton(text="Моя статистика 📊"), KeyboardButton(text="Интеграции ⚙️")] 
@@ -57,7 +66,7 @@ async def cmd_start(message: types.Message):
     await message.answer("Привет! Твой трекер готов.", reply_markup=main_keyboard)
 
 # ==========================================
-# БЛОК 1: УПРАВЛЕНИЕ ПРИВЫЧКАМИ (Стандарт)
+# БЛОК 1: УПРАВЛЕНИЕ ПРИВЫЧКАМИ
 # ==========================================
 
 @dp.message(F.text == "Новая привычка ➕")
@@ -93,13 +102,11 @@ async def show_habits_menu(message: types.Message):
     if not habits: return await message.answer("Список пуст.", reply_markup=main_keyboard)
     text_report = "<b>Твои привычки:</b>\n\n"
     keyboard_buttons = []
-    # h[0]=id, h[1]=name, h[2]=freq, h[3]=time
     for h in habits:
         text_report += f"🔹 <b>{h[1]}</b> ({h[2]}) — ⏰ {h[3]}\n"
         keyboard_buttons.append([InlineKeyboardButton(text=f"⚙️ {h[1]}", callback_data=f"open_{h[0]}")])
     await message.answer(text_report, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard_buttons), parse_mode="HTML")
 
-# Кнопки редактирования (Удалить / Время)
 @dp.callback_query(F.data.startswith("open_"))
 async def open_habit_options(callback: CallbackQuery):
     habit_id = callback.data.split("_")[1]
@@ -136,7 +143,7 @@ async def edit_time_finish(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Время обновлено!", reply_markup=main_keyboard)
 
 # ==========================================
-# БЛОК 2: КРАСИВАЯ СТАТИСТИКА
+# БЛОК 2: СТАТИСТИКА
 # ==========================================
 
 @dp.message(F.text == "Моя статистика 📊")
@@ -145,7 +152,6 @@ async def show_detailed_stats(message: types.Message):
     if not habits: return await message.answer("Нет данных.")
     
     report = "<b>📊 Твоя эффективность:</b>\n\n"
-    # h[1]=name, h[4]=done, h[5]=skip, h[6]=start_date
     for h in habits:
         done = h[4]; skip = h[5]; total = done + skip
         percent = int((done/total)*100) if total > 0 else 0
@@ -161,24 +167,20 @@ async def show_detailed_stats(message: types.Message):
     await message.answer(report, parse_mode="HTML")
 
 # ==========================================
-# БЛОК 3: ИНТЕГРАЦИИ (МАСТЕР НАСТРОЙКИ)
+# БЛОК 3: ИНТЕГРАЦИИ
 # ==========================================
 
 @dp.message(F.text == "Интеграции ⚙️")
 async def integrations_menu(message: types.Message):
-    # Проверяем, подключено ли уже
     current_link = get_user_sheet(message.from_user.id)
     status = "✅ Подключено" if current_link else "❌ Не подключено"
-    
     text = f"<b>Настройки интеграций</b>\nСтатус Google Sheets: {status}\n\nКуда хочешь сохранять отчеты?"
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📄 Google Sheets", callback_data="setup_google")],
         [InlineKeyboardButton(text="🔜 Notion (скоро)", callback_data="dummy_notion")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
-# Шаг 1: Инструкция
 @dp.callback_query(F.data == "setup_google")
 async def setup_google_step1(callback: CallbackQuery):
     bot_email = get_bot_email()
@@ -188,72 +190,44 @@ async def setup_google_step1(callback: CallbackQuery):
         "2. Нажми <b>Настройки доступа</b> (Share).\n"
         "3. Добавь этого бота как <b>Редактора</b>:\n"
     )
-    # Отправляем инструкцию
     await callback.message.edit_text(text, parse_mode="HTML")
-    
-    # Отправляем Email отдельным сообщением для копирования
     await callback.message.answer(f"`{bot_email}`", parse_mode="MarkdownV2")
-    
-    # Кнопка подтверждения
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я добавил бота, дальше", callback_data="setup_google_step2")]])
     await callback.message.answer("Когда добавишь бота, нажми кнопку:", reply_markup=kb)
 
-# Шаг 2: Запрос ссылки
 @dp.callback_query(F.data == "setup_google_step2")
 async def setup_google_step2(callback: CallbackQuery, state: FSMContext):
     await state.set_state(IntegrationSetup.waiting_for_link)
-    await callback.message.answer(
-        "Отлично! Теперь пришли мне <b>ссылку</b> на эту таблицу.\n"
-        "(Просто скопируй из адресной строки браузера)", 
-        parse_mode="HTML"
-    )
+    await callback.message.answer("Отлично! Теперь пришли мне <b>ссылку</b> на эту таблицу.\n(Просто скопируй из адресной строки браузера)", parse_mode="HTML")
 
-# Шаг 3: Проверка и сохранение
 @dp.message(IntegrationSetup.waiting_for_link)
 async def setup_google_finish(message: types.Message, state: FSMContext):
     link = message.text.strip()
-    
     msg = await message.answer("Проверяю доступ... 🔄")
-    
     if check_sheet_access(link):
         set_user_sheet(message.from_user.id, link)
         await msg.edit_text(f"✅ <b>Успешно!</b>\nТаблица подключена.\nТеперь все отчеты летят туда.")
     else:
-        await msg.edit_text(
-            "❌ <b>Ошибка доступа.</b>\n"
-            "Я не могу открыть эту таблицу. Проверь:\n"
-            "1. Ты точно добавил бота в Редакторы?\n"
-            "2. Ссылка правильная?\n\n"
-            "Попробуй прислать ссылку еще раз или нажми /start для выхода."
-        )
-        return # Не сбрасываем состояние, ждем новую ссылку
-
+        await msg.edit_text("❌ <b>Ошибка доступа.</b>\nЯ не могу открыть эту таблицу. Проверь права доступа бота.")
+        return
     await state.clear()
 
-
-# --- ОТЧЕТЫ (Callback) ---
+# --- ОТЧЕТЫ И РАССЫЛКА ---
 @dp.callback_query(F.data.startswith("done_") | F.data.startswith("skip_"))
 async def process_habit_action(callback: CallbackQuery):
     action, habit_id = callback.data.split("_")
     habit_name = get_habit_name(habit_id)
     is_done = (action == "done")
-    
     update_habit_stats(habit_id, is_done)
     
     status_text = "ВЫПОЛНЕНО" if is_done else "ПРОПУЩЕНО"
     sheet_link = get_user_sheet(callback.from_user.id)
     google_res = write_to_sheet(sheet_link, habit_name, status_text) if sheet_link else ""
     
-    # Красивый ответ без спама текстом про таблицу, если она не подключена
     icon = "✅ Молодец!" if is_done else "😴 Эх..."
-    if sheet_link and "Записано" in google_res:
-        new_text = f"{icon} (Сохранено в Google)"
-    else:
-        new_text = f"{icon}"
-        
+    new_text = f"{icon} (Сохранено в Google)" if (sheet_link and "Записано" in google_res) else f"{icon}"
     await callback.message.edit_text(new_text)
 
-# --- РАССЫЛКА ---
 async def check_reminders():
     habits = get_habits_by_time(datetime.now().strftime("%H:%M"))
     for hid, uid, hname in habits:
@@ -265,7 +239,7 @@ async def main():
     init_db()
     scheduler.add_job(check_reminders, 'cron', minute='*')
     scheduler.start()
-    print("🤖 Бот (Версия: Интеграции + Статистика) запущен...")
+    print("🤖 Бот запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
