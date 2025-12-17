@@ -10,7 +10,7 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemo
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from aiogram.client.session.aiohttp import AiohttpSession
+
 
 # ИМПОРТЫ
 from database import (
@@ -38,11 +38,9 @@ if not env_file: exit("❌ .env не найден")
 load_dotenv(env_file)
 
 token = os.getenv("BOT_TOKEN")
-if os.getenv("PYTHONANYWHERE_DOMAIN"):
-    session = AiohttpSession(proxy="http://proxy.server:3128")
-    bot = Bot(token=token, session=session)
-else:
-    bot = Bot(token=token)
+if not token:
+    exit("❌ Переменная окружения BOT_TOKEN не найдена. Пожалуйста, добавьте её в .env файл.")
+bot = Bot(token=token)
 
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
