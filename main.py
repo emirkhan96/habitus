@@ -1,7 +1,7 @@
 import asyncio
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv, find_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -12,46 +12,36 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.client.session.aiohttp import AiohttpSession
 
 # ИМПОРТЫ
-from database import init_db, add_habit, get_all_user_habits, update_habit_stats, set_user_sheet, get_user_sheet, get_habit_name, delete_habit, update_habit_time, get_habits_by_time
+from database import init_db, add_habit, get_all_user_habits, update_habit_stats, set_user_sheet, get_user_sheet, get_habit_name, delete_habit, update_habit_time, set_user_timezone, get_user_timezone, get_all_habits_with_users
 from google_manager import write_to_sheet, get_bot_email, check_sheet_access
 
 logging.basicConfig(level=logging.ERROR)
 
-# --- НАСТРОЙКА ОКРУЖЕНИЯ ---
 env_file = find_dotenv()
-if not env_file:
-    exit("❌ .env не найден")
+if not env_file: exit("❌ .env не найден")
 load_dotenv(env_file)
 
-# 1. Сначала загружаем токен
 token = os.getenv("BOT_TOKEN")
-if not token:
-    exit("❌ Ошибка: Переменная BOT_TOKEN не найдена в .env")
-
-# 2. Настройка бота под PythonAnywhere или Локальный запуск
 if os.getenv("PYTHONANYWHERE_DOMAIN"):
-    print("🌍 Запуск на PythonAnywhere (используем прокси)...")
     session = AiohttpSession(proxy="http://proxy.server:3128")
     bot = Bot(token=token, session=session)
 else:
-    print("💻 Локальный запуск...")
     bot = Bot(token=token)
 
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
 # --- СОСТОЯНИЯ ---
-class HabitForm(StatesGroup):
-    name = State(); frequency = State(); time = State()
-class EditForm(StatesGroup):
-    waiting_for_new_time = State()
-class IntegrationSetup(StatesGroup): 
-    waiting_for_link = State()
+class HabitForm(StatesGroup): name = State(); frequency = State(); time = State()
+class EditForm(StatesGroup): waiting_for_new_time = State()
+class IntegrationSetup(StatesGroup): waiting_for_link = State()
+class TimezoneSetup(StatesGroup): waiting_for_time = State() # Новое состояние
 
 # --- МЕНЮ ---
 kb_menu = [
     [KeyboardButton(text="Новая привычка ➕"), KeyboardButton(text="Мои привычки 📋")], 
-    [KeyboardButton(text="Моя статистика 📊"), KeyboardButton(text="Интеграции ⚙️")] 
+    [KeyboardButton(text="Моя статистика 📊"), KeyboardButton(text="Настройка времени 🕒")],
+    [KeyboardButton(text="Интеграции ⚙️")]
 ]
 main_keyboard = ReplyKeyboardMarkup(keyboard=kb_menu, resize_keyboard=True)
 
@@ -63,12 +53,55 @@ time_keyboard = ReplyKeyboardMarkup(keyboard=kb_time, resize_keyboard=True, one_
 # --- START ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    await message.answer("Привет! Твой трекер готов.", reply_markup=main_keyboard)
+    await message.answer("Привет! Давай настроим твои привычки.", reply_markup=main_keyboard)
+
+# ==========================================
+# БЛОК 0: НАСТРОЙКА ВРЕМЕНИ (НОВОЕ)
+# ==========================================
+@dp.message(F.text == "Настройка времени 🕒")
+async def setup_timezone_start(message: types.Message, state: FSMContext):
+    await state.set_state(TimezoneSetup.waiting_for_time)
+    await message.answer(
+        "Чтобы напоминания приходили вовремя, мне нужно знать твой часовой пояс.\n\n"
+        "⏰ <b>Напиши мне, сколько у тебя сейчас времени?</b>\n"
+        "(Например: 14:30 или 09:15)", 
+        parse_mode="HTML", reply_markup=ReplyKeyboardRemove()
+    )
+
+@dp.message(TimezoneSetup.waiting_for_time)
+async def setup_timezone_finish(message: types.Message, state: FSMContext):
+    try:
+        # 1. Парсим время пользователя
+        user_time_str = message.text.strip()
+        user_h, user_m = map(int, user_time_str.split(":"))
+        
+        # 2. Берем текущее время сервера (UTC)
+        server_now = datetime.utcnow()
+        
+        # 3. Создаем объект времени пользователя "сегодня"
+        user_now = server_now.replace(hour=user_h, minute=user_m)
+        
+        # 4. Считаем разницу
+        # Если пользователь ввел 18:00, а на сервере 13:00 -> разница +5 часов
+        diff = user_now - server_now
+        
+        # Округляем до часов (чтобы убрать минуты погрешности ввода)
+        offset_hours = round(diff.total_seconds() / 3600)
+        
+        # Сохраняем в базу
+        set_user_timezone(message.from_user.id, offset_hours)
+        
+        await state.clear()
+        
+        sign = "+" if offset_hours >= 0 else ""
+        await message.answer(f"✅ Понял! Твой часовой пояс: UTC{sign}{offset_hours}.\nТеперь напоминания будут приходить вовремя.", reply_markup=main_keyboard)
+        
+    except Exception:
+        await message.answer("❌ Не понимаю формат. Пожалуйста, напиши время как ЧЧ:ММ (например 18:30).")
 
 # ==========================================
 # БЛОК 1: УПРАВЛЕНИЕ ПРИВЫЧКАМИ
 # ==========================================
-
 @dp.message(F.text == "Новая привычка ➕")
 async def start_new_habit(message: types.Message, state: FSMContext):
     await state.set_state(HabitForm.name)
@@ -145,51 +178,33 @@ async def edit_time_finish(message: types.Message, state: FSMContext):
 # ==========================================
 # БЛОК 2: СТАТИСТИКА
 # ==========================================
-
 @dp.message(F.text == "Моя статистика 📊")
 async def show_detailed_stats(message: types.Message):
     habits = get_all_user_habits(message.from_user.id)
     if not habits: return await message.answer("Нет данных.")
-    
     report = "<b>📊 Твоя эффективность:</b>\n\n"
     for h in habits:
         done = h[4]; skip = h[5]; total = done + skip
         percent = int((done/total)*100) if total > 0 else 0
         bars = "🟩" * (percent // 10) + "⬜" * ((100 - percent) // 10)
-        
-        report += (
-            f"🔹 <b>{h[1]}</b>\n"
-            f"📅 Старт: {h[6]}\n"
-            f"✅ Выполнено: {done} | ❌ Пропущено: {skip}\n"
-            f"📈 Успех: {percent}%\n"
-            f"{bars}\n\n"
-        )
+        report += (f"🔹 <b>{h[1]}</b>\n✅ Выполнено: {done} | ❌ Пропущено: {skip}\n📈 Успех: {percent}%\n{bars}\n\n")
     await message.answer(report, parse_mode="HTML")
 
 # ==========================================
 # БЛОК 3: ИНТЕГРАЦИИ
 # ==========================================
-
 @dp.message(F.text == "Интеграции ⚙️")
 async def integrations_menu(message: types.Message):
     current_link = get_user_sheet(message.from_user.id)
     status = "✅ Подключено" if current_link else "❌ Не подключено"
     text = f"<b>Настройки интеграций</b>\nСтатус Google Sheets: {status}\n\nКуда хочешь сохранять отчеты?"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📄 Google Sheets", callback_data="setup_google")],
-        [InlineKeyboardButton(text="🔜 Notion (скоро)", callback_data="dummy_notion")]
-    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📄 Google Sheets", callback_data="setup_google")]])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "setup_google")
 async def setup_google_step1(callback: CallbackQuery):
     bot_email = get_bot_email()
-    text = (
-        "<b>Настройка Google Sheets 📄</b>\n\n"
-        "1. Создай новую таблицу (или открой существующую).\n"
-        "2. Нажми <b>Настройки доступа</b> (Share).\n"
-        "3. Добавь этого бота как <b>Редактора</b>:\n"
-    )
+    text = ("<b>Настройка Google Sheets 📄</b>\n\n1. Создай новую таблицу.\n2. Добавь бота как Редактора:\n")
     await callback.message.edit_text(text, parse_mode="HTML")
     await callback.message.answer(f"`{bot_email}`", parse_mode="MarkdownV2")
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Я добавил бота, дальше", callback_data="setup_google_step2")]])
@@ -198,7 +213,7 @@ async def setup_google_step1(callback: CallbackQuery):
 @dp.callback_query(F.data == "setup_google_step2")
 async def setup_google_step2(callback: CallbackQuery, state: FSMContext):
     await state.set_state(IntegrationSetup.waiting_for_link)
-    await callback.message.answer("Отлично! Теперь пришли мне <b>ссылку</b> на эту таблицу.\n(Просто скопируй из адресной строки браузера)", parse_mode="HTML")
+    await callback.message.answer("Пришли мне <b>ссылку</b> на таблицу.", parse_mode="HTML")
 
 @dp.message(IntegrationSetup.waiting_for_link)
 async def setup_google_finish(message: types.Message, state: FSMContext):
@@ -206,13 +221,13 @@ async def setup_google_finish(message: types.Message, state: FSMContext):
     msg = await message.answer("Проверяю доступ... 🔄")
     if check_sheet_access(link):
         set_user_sheet(message.from_user.id, link)
-        await msg.edit_text(f"✅ <b>Успешно!</b>\nТаблица подключена.\nТеперь все отчеты летят туда.")
+        await msg.edit_text(f"✅ <b>Успешно!</b> Таблица подключена.")
     else:
-        await msg.edit_text("❌ <b>Ошибка доступа.</b>\nЯ не могу открыть эту таблицу. Проверь права доступа бота.")
+        await msg.edit_text("❌ <b>Ошибка доступа.</b>")
         return
     await state.clear()
 
-# --- ОТЧЕТЫ И РАССЫЛКА ---
+# --- ОТЧЕТЫ И РАССЫЛКА (УМНАЯ) ---
 @dp.callback_query(F.data.startswith("done_") | F.data.startswith("skip_"))
 async def process_habit_action(callback: CallbackQuery):
     action, habit_id = callback.data.split("_")
@@ -229,17 +244,44 @@ async def process_habit_action(callback: CallbackQuery):
     await callback.message.edit_text(new_text)
 
 async def check_reminders():
-    habits = get_habits_by_time(datetime.now().strftime("%H:%M"))
-    for hid, uid, hname in habits:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Сделано ✅", callback_data=f"done_{hid}"), InlineKeyboardButton(text="Пропуск ❌", callback_data=f"skip_{hid}")]])
-        try: await bot.send_message(uid, f"🔔 <b>Пора: {hname}</b>", reply_markup=kb, parse_mode="HTML")
-        except: pass
+    # 1. Получаем текущее время сервера в UTC
+    now_utc = datetime.utcnow()
+    # Округляем до минут (отбрасываем секунды), чтобы четко совпадало с базой
+    now_utc = now_utc.replace(second=0, microsecond=0)
+    
+    # 2. Получаем ВСЕ привычки
+    all_habits = get_all_habits_with_users() # Возвращает (id, user_id, name, time_str)
+    
+    # 3. Проверяем каждую привычку
+    for habit in all_habits:
+        habit_id, user_id, habit_name, habit_time_str = habit
+        
+        # Пропускаем, если "Не напоминать"
+        if habit_time_str == "Без напоминаний" or ":" not in habit_time_str:
+            continue
+            
+        # Узнаем часовой пояс пользователя (или берем +3 по дефолту)
+        offset = get_user_timezone(user_id)
+        
+        # Вычисляем время у пользователя: UTC сервера + его сдвиг
+        user_local_time = now_utc + timedelta(hours=offset)
+        user_time_str = user_local_time.strftime("%H:%M")
+        
+        # 4. Если время совпало — отправляем!
+        if user_time_str == habit_time_str:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Сделано ✅", callback_data=f"done_{habit_id}"), InlineKeyboardButton(text="Пропуск ❌", callback_data=f"skip_{habit_id}")]])
+            try: 
+                await bot.send_message(user_id, f"🔔 <b>Пора: {habit_name}</b>", reply_markup=kb, parse_mode="HTML")
+                print(f"📩 Отправлено пользователю {user_id}: {habit_name}")
+            except Exception as e: 
+                print(f"❌ Не удалось отправить: {e}")
 
 async def main():
     init_db()
+    # Запускаем планировщик
     scheduler.add_job(check_reminders, 'cron', minute='*')
     scheduler.start()
-    print("🤖 Бот запущен...")
+    print("🤖 Бот (Версия: Умное время) запущен...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
